@@ -68,15 +68,21 @@
 #'
 #' If you want to include interaction terms in your model this can be done
 #' by providing them to the `covariates` argument of [set_vars()]
-#' e.g. `set_vars(covariates = c("sex*age"))`.
+#' e.g. `set_vars(covariates = c("sex*age"))`. Interactions involving the treatment
+#' group (`vars$group`) are not supported and will result in an error, because the
+#' treatment contrasts would depend on the reference values of the interacting
+#' covariates.
 #'
 #' Note that the treatment effects (`trt`, `trt_alt2`, ...) are the relevant linear
-#' combinations of the model coefficients, i.e. the group main-effect contrasts evaluated
-#' at the reference level of any covariates. The least square means (`lsm_*`) are instead
-#' computed according to the requested `weights`. When `group` interacts with a covariate
-#' these two quantities differ, so `trt` is not in general equal to `lsm_alt - lsm_ref`.
-#' This matches the behaviour of the original two-group implementation, where `trt` has
-#' always been the model coefficient.
+#' combinations of the group main-effect coefficients. The least square means (`lsm_*`)
+#' are computed according to the requested `weights`.
+#'
+#' For treatment contrasts, numeric covariates are set to their observed means
+#' within each visit, excluding missing values, before formula transformations
+#' are applied (e.g. `log(mean(age, na.rm = TRUE))` for `log(age)`). Factor
+#' covariates are set to their first level and logical covariates to `FALSE`.
+#' With treatment-group interactions excluded, these reference values do not
+#' affect the treatment contrasts, provided the transformed values are finite.
 #'
 #' @inheritSection lsmeans Weighting
 #'
@@ -169,7 +175,8 @@ ancova <- function(
         data = data,
         vars = vars,
         visits = visits,
-        weights = weights
+        weights = weights,
+        include_variance = include_variance
     )
 }
 
@@ -188,7 +195,8 @@ ancova_core <- function(
     data,
     vars,
     visits = NULL,
-    weights = c("counterfactual", "equal", "proportional_em", "proportional")
+    weights = c("counterfactual", "equal", "proportional_em", "proportional"),
+    include_variance = FALSE
 ) {
     outcome <- vars[["outcome"]]
     group <- vars[["group"]]
@@ -197,7 +205,8 @@ ancova_core <- function(
     group_contrasts <- vars[["group_contrasts"]]
     weights <- match.arg(weights)
 
-    expected_vars <- all.vars(as_simple_formula(outcome, c(covariates, group)))
+    model_formula <- as_simple_formula(outcome, c(covariates, group))
+    expected_vars <- all.vars(model_formula)
 
     assert_that(
         !any(visit %in% expected_vars),
@@ -238,6 +247,14 @@ ancova_core <- function(
     )
 
     assert_that(
+        !formula_has_interaction(model_formula, group),
+        msg = paste(
+            "Interactions involving the treatment group are not supported in ANCOVA.",
+            "Please adjust `vars$covariates` accordingly"
+        )
+    )
+
+    assert_that(
         is.null(visits) | is.character(visits),
         msg = "`visits` must be NULL or a character vector"
     )
@@ -260,16 +277,13 @@ ancova_core <- function(
         visits,
         function(x) {
             data2 <- data[data[[visit]] == x, ]
-            res <- ancova_single(data2, outcome, group, covariates, weights,
-                                 include_variance = include_variance)
-            names(res) <- paste0(names(res), "_", x)
-            return(res)
             fit <- ancova_single(
                 data2,
                 outcome,
                 group,
                 covariates,
                 weights,
+                include_variance = include_variance,
                 group_contrasts
             )
             meta <- attr(fit, "rbmi_par_meta")
@@ -320,6 +334,10 @@ ancova_core <- function(
 #' to be included in the model as well as any interaction terms.
 #'
 #' @inheritParams ancova
+#' @param include_variance Logical. If `TRUE`, a `var` entry is prepended to
+#'   the results containing the residual variance estimate (`sigma^2`), its
+#'   approximate standard error, and the residual degrees of freedom.
+#'   Defaults to `FALSE`.
 #' @inheritSection lsmeans Weighting
 #'
 #' @param group_contrasts Optional list specifying bespoke treatment-group contrasts.
@@ -353,7 +371,7 @@ ancova_single <- function(
     group,
     covariates,
     weights = c("counterfactual", "equal", "proportional_em", "proportional"),
-    include_variance = FALSE
+    include_variance = FALSE,
     group_contrasts = NULL
 ) {
     weights <- match.arg(weights)
@@ -426,6 +444,21 @@ ancova_single <- function(
     )
 
     res <- append(trt, lsm)
+
+    # Optionally append residual variance estimate
+    if (include_variance) {
+        sigma2 <- sigma(mod)^2
+        res <- c(
+            list(
+                var = list(
+                    est = sigma2,
+                    se = sigma2 * sqrt(2 / df_res),
+                    df = df_res
+                )
+            ),
+            res
+        )
+    }
 
     # Parameter metadata (uses the actual group level labels, not ref/alt)
     meta_trt <- data.frame(
@@ -681,9 +714,12 @@ resolve_contrast_weights <- function(x, orig_levels) {
 #' Build the ANCOVA contrast design matrix
 #'
 #' Creates one complete model-matrix row per treatment-group level. Numeric
-#' covariates are set to zero, logical covariates to `FALSE`, and factor covariates
+#' covariates are set to their means in `data`, excluding missing values, logical
+#' covariates to `FALSE`, and factor covariates
 #' to their first level. The fitted model's contrast coding is retained so that
 #' differences between rows include all required interaction coefficients.
+#' Means are calculated on the raw covariate scale before applying formula
+#' transformations, using all non-missing values in the supplied visit data.
 #'
 #' @param model A fitted `lm` model containing the internal `rbmiGroup` factor.
 #' @param data The raw model data used to fit `model`, including the untransformed
@@ -715,7 +751,7 @@ ancova_contrast_design <- function(model, data, outcome) {
         } else if (is.logical(reference_data[[var]])) {
             reference_data[[var]] <- FALSE
         } else if (is.numeric(reference_data[[var]])) {
-            reference_data[[var]] <- 0
+            reference_data[[var]] <- mean(data[[var]], na.rm = TRUE)
         }
     }
     reference_data[["rbmiGroup"]] <- factor(
@@ -749,10 +785,12 @@ ancova_contrast_design <- function(model, data, outcome) {
 #' @return A list with elements `est`, `se` and `df`.
 #'
 #' @details
-#' The contrast is evaluated at the covariate reference (covariate = 0): covariate
-#' main-effect and interaction columns receive zero weight and cancel for a
-#' sum-to-zero contrast. Group-by-covariate interaction columns are included when they
-#' are non-zero at that reference point. A required coefficient that is missing,
+#' The contrast is evaluated at the reference values defined by
+#' [ancova_contrast_design()]. Finite columns involving only non-group covariates
+#' are identical across group rows and cancel for a sum-to-zero contrast.
+#' Group-by-covariate interaction columns are included when they are non-zero at
+#' that reference point, although [ancova()] currently rejects such interactions.
+#' A required coefficient that is missing,
 #' aliased (`NA`) or absent from the
 #' variance-covariance matrix indicates a rank-deficient design and triggers an error
 #' rather than a silently dropped term.
@@ -794,15 +832,4 @@ ancova_linear_contrast <- function(
         se = sqrt(drop(t(lvec) %*% vcov_required %*% lvec)),
         df = df_res
     )
-    if (include_variance) {
-        x <- c(
-            list(var = list(
-                est = summary(mod)$sigma^2,
-                se = summary(mod)$sigma^2 / sqrt(df.residual(mod) / 2),
-                df = df.residual(mod)
-            )),
-            x
-        )
-    }
-    return(x)
 }
